@@ -24,6 +24,11 @@ CHUNK_DURATION = 0.5  # Sekunden
 SILENCE_THRESHOLD = 1.0  # Sekunden
 PIPER_VOICE_PATH = "piper_voices/de_DE-thorsten-high.onnx"
 PIPER_COMMAND = "piper"
+AUDIO_CHUNK_DIR = "audio_chunks"
+PIPER_OUTPUT_DIR = "piper_output"
+
+os.makedirs(AUDIO_CHUNK_DIR, exist_ok=True)
+os.makedirs(PIPER_OUTPUT_DIR, exist_ok=True)
 
 full_transcript = ""
 audio_queue = queue.Queue()
@@ -79,7 +84,7 @@ def process_audio():
 
 # === AUDIOCHUNK ALS WAV SPEICHERN UND TRANSKRIBIEREN ===
 def save_and_transcribe(audio_chunk):
-    filename = f"chunk_{int(time.time())}.wav"
+    filename = os.path.join(AUDIO_CHUNK_DIR, f"chunk_{int(time.time())}.wav")
     sf.write(filename, audio_chunk, SAMPLE_RATE)
     print(f"[DATEI] Gespeichert: {filename}")
     
@@ -128,8 +133,12 @@ def query_llm(transcript, partei):
 # === TEXT-TO-SPEECH ===
 def speak_text(text):
     print("[TTS] Piper-Ausgabe starten...")
-    with open("piper_input.txt", "w", encoding="utf-8") as f:
+    input_txt_path = os.path.join(PIPER_OUTPUT_DIR, "piper_input.txt")
+    output_wav_path = os.path.join(PIPER_OUTPUT_DIR, "response.wav")
+
+    with open(input_txt_path, "w", encoding="utf-8") as f:
         f.write(text)
+
     subprocess.run([
         PIPER_COMMAND,
         "--model", PIPER_VOICE_PATH,
@@ -138,7 +147,7 @@ def speak_text(text):
     ])
 
     import playsound
-    playsound.playsound("response.wav")
+    playsound.playsound(output_wav_path)
 
 # === GUI SETUP ===
 def start_gui():
