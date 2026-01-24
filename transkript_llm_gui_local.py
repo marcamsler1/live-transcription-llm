@@ -1,4 +1,5 @@
 import os
+import json
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -15,10 +16,13 @@ from tkinter import ttk
 from tkinter import messagebox
 import soundfile as sf
 import subprocess
+from openai import OpenAI
 
 # === KONFIGURATION ===
 WHISPER_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = "gpt-4.1"
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+TEMPERATURE = 0.7
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.5  # Sekunden
 SILENCE_THRESHOLD = 1.0  # Sekunden
@@ -29,6 +33,9 @@ PIPER_OUTPUT_DIR = "piper_output"
 
 os.makedirs(AUDIO_CHUNK_DIR, exist_ok=True)
 os.makedirs(PIPER_OUTPUT_DIR, exist_ok=True)
+
+vs_dict_json_string = os.getenv("VS_DICT_JSON", "{}")
+VS_DICT = json.loads(vs_dict_json_string)
 
 full_transcript = ""
 audio_queue = queue.Queue()
@@ -108,26 +115,33 @@ def save_and_transcribe(audio_chunk):
 
 # === OPENAI LLM AUFRUF ===
 def query_llm(transcript, partei):
-    prompt = f"Du bist ein Sprachassistent, der wie ein Vertreter oder eine Vertreterin der Partei {partei} antwortet. Sprich Hochdeutsch. Beziehe dich auf die folgende Diskussion und formuliere eine kurze Antwort aus Sicht der Partei:\n\n{transcript.strip()}"
+    client = OpenAI(api_key=WHISPER_API_KEY)
+    prompt = f"Sie übernehmen die Rolle des Fraktionschefs der {partei} der Stadt St.Gallen. Sprechen Sie Hochdeutsch. Beziehen Sie sich auf die folgende Diskussion und formulieren Sie eine kurze Antwort aus Sicht der Partei:\n\n{transcript.strip()}"
 
-    headers = {
-        "Authorization": f"Bearer {WHISPER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    json = {
-        "model": "gpt-4",
-        "messages": [
-            {"role": "system", "content": "Du bist ein politischer Assistent."},
-            {"role": "user", "content": prompt}
-        ]
-    }
-    response = requests.post(OPENAI_API_URL, headers=headers, json=json)
-    if response.status_code == 200:
-        reply = response.json()['choices'][0]['message']['content']
+    tools = []
+    tool_choice = None
+    if partei in VS_DICT:
+        tools = [{
+            "type": "file_search",
+            "vector_store_ids": [VS_DICT[partei]],
+            "max_num_results": 20
+        }]
+        tool_choice = "required"
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        temperature=TEMPERATURE,
+        tool_choice=tool_choice,
+        tools=tools,
+        input=prompt
+    )
+
+    try:
+        reply = response.output_text
         print(f"[LLM-ANTWORT]\n{reply}\n")
         return reply
-    else:
-        print(f"[FEHLER] OpenAI LLM: {response.text}")
+    except Exception as e:
+        print(f"[FEHLER] OpenAI LLM: {e}")
         return "Fehler bei der LLM-Abfrage."
 
 # === TEXT-TO-SPEECH ===
@@ -142,8 +156,8 @@ def speak_text(text):
     subprocess.run([
         PIPER_COMMAND,
         "--model", PIPER_VOICE_PATH,
-        "--output-file", "response.wav",
-        "--input-file", "piper_input.txt"
+        "--output-file", output_wav_path,
+        "--input-file", input_txt_path
     ])
 
     import playsound
@@ -167,7 +181,7 @@ def start_gui():
     label.pack()
 
     dropdown = ttk.Combobox(root, textvariable=partei_var)
-    dropdown['values'] = ("SP", "FDP", "SVP", "Die Mitte", "GLP", "Grüne")
+    dropdown['values'] = ("SP", "FDP", "SVP", "MITTE", "GLP", "GRUENE")
     dropdown.pack()
 
     button = tk.Button(root, text="Antwort generieren", command=on_button_click)
