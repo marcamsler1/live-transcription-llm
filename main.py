@@ -3,6 +3,8 @@ import json
 import time
 import queue
 import threading
+import zipfile
+import xml.etree.ElementTree as ET
 from copy import deepcopy
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -45,6 +47,7 @@ DEFAULT_CONFIG = {
     "audio_chunk_dir": "audio_chunks",
     "piper_output_dir": "piper_output",
     "session_dir": "sessions",
+    "project_descriptions_dir": "project_descriptions",
     "config_path": "config.json"
 }
 
@@ -92,11 +95,13 @@ PIPER_COMMAND = CONFIG["piper_command"]
 AUDIO_CHUNK_DIR = CONFIG["audio_chunk_dir"]
 PIPER_OUTPUT_DIR = CONFIG["piper_output_dir"]
 SESSION_DIR = CONFIG["session_dir"]
+PROJECT_DESCRIPTIONS_DIR = CONFIG["project_descriptions_dir"]
 WHISPER_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 os.makedirs(AUDIO_CHUNK_DIR, exist_ok=True)
 os.makedirs(PIPER_OUTPUT_DIR, exist_ok=True)
 os.makedirs(SESSION_DIR, exist_ok=True)
+os.makedirs(PROJECT_DESCRIPTIONS_DIR, exist_ok=True)
 
 vs_dict_json_string = os.getenv("VS_DICT_JSON", "{}")
 VS_DICT = json.loads(vs_dict_json_string)
@@ -336,7 +341,10 @@ class LLMService:
         self.client = OpenAI(api_key=api_key)
         self.logger = logger
 
-    def build_prompt(self, context_text: str, partei: str) -> str:
+    def build_prompt(self, context_text: str, partei: str, project_context: str = "") -> str:
+        project_section = ""
+        if project_context.strip():
+            project_section = f"\n\nProjektinformationen:\n{project_context.strip()}"
         return (
             f"Sie sprechen als Fraktionschef der {partei} im Stadtparlament St.Gallen.\n\n"
             f"Ihre Aufgabe:\n"
@@ -352,7 +360,7 @@ class LLMService:
             f"- Erfinden Sie keine Fakten, Zahlen oder Beschlüsse.\n"
             f"- Wenn Informationen fehlen, formulieren Sie vorsichtig und allgemein.\n"
             f"- Orientieren Sie sich an typischen politischen Grundhaltungen der {partei}.\n\n"
-            f"Kontext:\n{context_text.strip()}"
+            f"Kontext:\n{context_text.strip()}{project_section}"
         )
 
     def build_summary_prompt(self, existing_summary: str, text_to_summarize: str) -> str:
@@ -380,8 +388,8 @@ class LLMService:
             }], "required")
         return ([], None)
 
-    def query(self, context_text: str, partei: str, vs_dict: Dict[str, str]) -> str:
-        prompt = self.build_prompt(context_text, partei)
+    def query(self, context_text: str, partei: str, vs_dict: Dict[str, str], project_context: str = "") -> str:
+        prompt = self.build_prompt(context_text, partei, project_context)
         tools, tool_choice = self._build_tools(partei, vs_dict)
 
         try:
@@ -466,6 +474,52 @@ class TTSService:
             raise RuntimeError(f"Die generierte Audiodatei konnte nicht abgespielt werden: {e}") from e
 
 
+class ProjectDescriptionService:
+    def __init__(self, project_dir: str):
+        self.project_dir = project_dir
+
+    def list_projects(self) -> List[str]:
+        if not os.path.isdir(self.project_dir):
+            return []
+        projects = []
+        for filename in os.listdir(self.project_dir):
+            lower = filename.lower()
+            if lower.endswith(".docx") and not filename.startswith("~$"):
+                projects.append(filename)
+        return sorted(projects, key=str.casefold)
+
+    def _extract_docx_text(self, filepath: str) -> str:
+        try:
+            with zipfile.ZipFile(filepath, "r") as archive:
+                xml_bytes = archive.read("word/document.xml")
+        except Exception as e:
+            raise RuntimeError(f"Projektdatei konnte nicht gelesen werden: {e}") from e
+
+        try:
+            root = ET.fromstring(xml_bytes)
+            namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            paragraphs = []
+            for paragraph in root.findall(".//w:p", namespace):
+                runs = []
+                for text_node in paragraph.findall(".//w:t", namespace):
+                    if text_node.text:
+                        runs.append(text_node.text)
+                line = "".join(runs).strip()
+                if line:
+                    paragraphs.append(line)
+            return "\n".join(paragraphs).strip()
+        except Exception as e:
+            raise RuntimeError(f"Projektdatei konnte nicht verarbeitet werden: {e}") from e
+
+    def get_project_text(self, project_filename: str) -> str:
+        if not project_filename:
+            return ""
+        filepath = os.path.join(self.project_dir, project_filename)
+        if not os.path.exists(filepath):
+            raise RuntimeError("Die ausgewählte Projektdatei wurde nicht gefunden.")
+        return self._extract_docx_text(filepath)
+
+
 class AudioRecorder:
     def __init__(self, audio_queue: queue.Queue, logger: AppLogger, status_callback: Callable[[str], None]):
         self.audio_queue = audio_queue
@@ -519,6 +573,7 @@ class DiscussionAssistantApp:
         self.logger = AppLogger(log_callback=lambda msg: self.root.after(0, lambda: self.set_status(msg)))
         self.audio_queue: queue.Queue = queue.Queue()
         self.conversation_manager = ConversationManager()
+        self.project_display_to_filename: Dict[str, str] = {}
 
         self.vad_triggered = False
         self.speech_buffer: List[np.ndarray] = []
@@ -554,9 +609,11 @@ class DiscussionAssistantApp:
             logger=self.logger,
         )
         self.session_service = SessionService(session_dir=SESSION_DIR, logger=self.logger)
+        self.project_description_service = ProjectDescriptionService(project_dir=PROJECT_DESCRIPTIONS_DIR)
 
         self.processing_thread = threading.Thread(target=self.process_audio, daemon=True)
         self.processing_thread.start()
+        self.refresh_project_dropdown()
         self.set_status("Bereit")
 
     # === GUI ===
@@ -569,6 +626,13 @@ class DiscussionAssistantApp:
         self.dropdown = ttk.Combobox(top_frame, textvariable=self.partei_var, state="readonly", width=15)
         self.dropdown["values"] = tuple(CONFIG["party_options"])
         self.dropdown.pack(side="left", padx=(8, 20))
+
+        tk.Label(top_frame, text="Projekt:").pack(side="left")
+        self.project_var = tk.StringVar(value="Kein Projekt")
+        self.project_dropdown = ttk.Combobox(top_frame, textvariable=self.project_var, state="readonly", width=30)
+        self.project_dropdown["values"] = ("Kein Projekt",)
+        self.project_dropdown.current(0)
+        self.project_dropdown.pack(side="left", padx=(8, 8))
 
         self.start_button = tk.Button(top_frame, text="Aufnahme starten", command=self.start_recording)
         self.start_button.pack(side="left", padx=4)
@@ -610,6 +674,34 @@ class DiscussionAssistantApp:
 
     def set_status(self, text: str):
         self.status_var.set(text)
+
+    def _format_project_display_name(self, filename: str) -> str:
+        name, _ = os.path.splitext(filename)
+        if name.lower().startswith("one-pager_"):
+            name = name[len("One-Pager_"):]
+        return name.replace("_", " ").strip()
+
+    def refresh_project_dropdown(self):
+        projects = self.project_description_service.list_projects()
+        self.project_display_to_filename = {}
+        display_names: List[str] = []
+
+        for filename in projects:
+            display_name = self._format_project_display_name(filename)
+            if not display_name:
+                display_name = filename
+            if display_name in self.project_display_to_filename:
+                display_name = f"{display_name} ({filename})"
+            self.project_display_to_filename[display_name] = filename
+            display_names.append(display_name)
+
+        options = ["Kein Projekt", *display_names]
+        self.project_dropdown["values"] = tuple(options)
+        current = self.project_var.get()
+        if current in options:
+            self.project_var.set(current)
+        else:
+            self.project_var.set("Kein Projekt")
 
     def show_error(self, title: str, message: str):
         self.root.after(0, lambda: messagebox.showerror(title, message))
@@ -823,7 +915,13 @@ class DiscussionAssistantApp:
 
     def _generate_response_worker(self, context_text: str, partei: str):
         try:
-            response = self.llm_service.query(context_text, partei, VS_DICT)
+            project_name = self.project_var.get().strip()
+            project_context = ""
+            if project_name and project_name != "Kein Projekt":
+                project_filename = self.project_display_to_filename.get(project_name, project_name)
+                project_context = self.project_description_service.get_project_text(project_filename)
+
+            response = self.llm_service.query(context_text, partei, VS_DICT, project_context)
             self.conversation_manager.set_last_response(response)
             self.root.after(0, lambda: self.update_answer_display(response))
             self.root.after(0, lambda: self.speak_button.configure(state="normal"))
